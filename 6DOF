@@ -1,0 +1,112 @@
+import numpy as np
+import pandas as pd
+from scipy.spatial.transform import Rotation as Rsc
+
+def estimate_transformation(faro_pts, robot_pts):
+    centroid_faro = np.mean(faro_pts, axis=0)
+    centroid_robot = np.mean(robot_pts, axis=0)
+    Q = faro_pts - centroid_faro
+    P = robot_pts - centroid_robot
+
+    H = Q.T @ P
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    t = centroid_robot - R @ centroid_faro
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t
+
+    return T
+
+def normal_to_rotation(normal):
+    z_axis = normal / np.linalg.norm(normal)
+    x_temp = np.array([1.0, 0.0, 0.0]) if abs(z_axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    x_axis = np.cross(x_temp, z_axis)
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    rot_matrix = np.stack([x_axis, y_axis, z_axis], axis=1)
+    return rot_matrix
+
+def transform_points(faro_points, T, correction=None):
+    positions = faro_points[:, :3]
+    normals = faro_points[:, 3:6]
+
+    homo = np.hstack((positions, np.ones((positions.shape[0], 1))))
+    transformed_xyz = (T @ homo.T).T[:, :3]
+
+    RxRyRz_list = []
+    for i, n in enumerate(normals):
+        try:
+            rot_matrix = normal_to_rotation(n)
+            if correction is not None:
+                if not isinstance(correction, np.ndarray):
+                    correction = correction.as_matrix()
+                if correction.shape != (3, 3):
+                    raise ValueError(f"correction shape 異常: {correction.shape}")
+                rot_matrix = correction @ rot_matrix
+            r = Rsc.from_matrix(rot_matrix)
+            angles = r.as_euler('xyz', degrees=True)
+            RxRyRz_list.append(angles)
+        except Exception as inner_e:
+            print(f"⚠️ 第 {i} 筆 normal 發生錯誤：{inner_e}")
+            RxRyRz_list.append([np.nan, np.nan, np.nan])
+
+    RxRyRz = np.array(RxRyRz_list)
+    return np.hstack((transformed_xyz, RxRyRz))
+
+
+def process_all_sheets(input_path, robot_data_path, output_path):
+    faro_excel = pd.ExcelFile(input_path)
+    robot_excel = pd.ExcelFile(robot_data_path)
+    writer = pd.ExcelWriter(output_path, engine='xlsxwriter')
+
+    for sheet_name in faro_excel.sheet_names:
+        print(sheet_name)
+        try:
+            faro_df = faro_excel.parse(sheet_name)
+            robot_df = robot_excel.parse(sheet_name)
+
+            faro_subset = faro_df.iloc[:6][["X", "Y", "Z"]].to_numpy(dtype=float)
+            robot_subset = robot_df.iloc[:6][["X", "Y", "Z"]].to_numpy(dtype=float)
+
+            T = estimate_transformation(faro_subset, robot_subset)
+
+            all_faro_xyz_normals = faro_df[["X", "Y", "Z", "Nx", "Ny", "Nz"]].to_numpy(dtype=float)
+
+            # 預設不套用修正角度
+            correction = None
+
+            # 嘗試從第一筆建立修正角度（如果有角度欄位）
+            try:
+                robot_angles = robot_df.iloc[0][["Rx", "Ry", "Rz"]].to_numpy(dtype=float)
+                if robot_angles.shape[0] != 3 or np.isnan(robot_angles).any():
+                    raise ValueError("角度缺失或非數值")
+                target_rot = Rsc.from_euler('xyz', robot_angles, degrees=True)
+                first_normal = all_faro_xyz_normals[0, 3:6]
+                est_rot = Rsc.from_matrix(normal_to_rotation(first_normal))
+                correction = target_rot * est_rot.inv()
+            except Exception as angle_err:
+                print(f"⚠️ {sheet_name} 的角度資料異常，跳過角度校正：{angle_err}")
+
+            transformed = transform_points(all_faro_xyz_normals, T, correction)
+
+            result_df = pd.DataFrame(transformed, columns=["X", "Y", "Z", "Rx", "Ry", "Rz"])
+            result_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+            print(f"✅ 處理完成：{sheet_name}")
+        except Exception as e:
+            print(f"⚠️ 工作表 {sheet_name} 發生錯誤：{e}")
+
+    writer.close()
+
+# ✅ 檔案路徑
+faro_path = "C:/Users/Mou/Desktop/Plane_Fitted_BySheet.xlsx"
+robot_path = "C:/Users/Mou/Desktop/6Dof_coordinade.xlsx"
+output_path = "C:/Users/Mou/Desktop/6Dof_Transformed.xlsx"
+
+process_all_sheets(faro_path, robot_path, output_path)
